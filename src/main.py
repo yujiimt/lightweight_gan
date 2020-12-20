@@ -6,6 +6,9 @@ from torch.functional import F
 
 def default(val, d):
     return val if exists(val) else d
+def upsample(scale_factor = 2):
+    return nn.upsample(scale_factor = scale_factor)
+
 
 
 class Generator(nn.Module):
@@ -52,9 +55,69 @@ class Generator(nn.Module):
         
         if image_width in attn_res_layers:
             attn = Rezero(GSA(dim=chain_in, norm_queries=True))
-            
+        
+        sle = None
+        if res in self.sle_map:
+            residual_layer = self.sle_map[res]
+            sle_chan_out = self.res_to_feature_map[residual_layer - 1][-1]
 
+            sle = SLE(
+                chain_in = chan_out,
+                chan_out = sle_chan_out
+            )
+        sle_spatial = None
+        if use_sle_spatial and res <= (resolution - self.num_layers_spatial_res):
+            sle_spatial = SpatialSLE(
+                upsample_times = self.num_layers_spatial_res,
+                num_groups = 2 if res < 8 else 1
+            )
+        layer = nn.ModuleList([
+            nn.Sequential(
+                upsample(),
+                Blur(),
+                nn.Conv2d(chain_in, chan_out * 2, 3, padding = 1),
+                norm_class(chan_out * 2),
+                nn.GLU(dim = 1)
+            ),
+            sle,
+            sle_spatial,
+            attn
+        ])
+        self.layer.append(layer)
 
+    self.out_conv = nn.Conv2d(features[-1], init_channel, 3, padding = 1)
+
+def forward(self, x):
+    x = rearrange(x, 'b c -> b c () ()')
+    x = self.initial_conv(x)
+    x = F.normalize(x, dim = 1)
+
+    residuals = dict()
+    spatial_residual = dict()
+
+    for (res, (up, sle, sle_spatial, attn)) in zip(self.res_layers, self.layers):
+        if exists(sle_spatial):
+            spatial_res = sle_spatial(x)
+            spatial_residual[res + self.num_layers_spatial_res] = spatial_res
+
+        if exists(attn):
+            x = attn(x) + x
+        
+        x = up(x)
+
+        if exists(sle):
+            out_res = self.sle_map[res]
+            residual = sle(x)
+            residuals[out_res] = residual
+
+        next_res = res + 1
+        if next_res in residuals:
+            x = x * residuals[next_res]
+        
+        if next_res in spatial_residual:
+            x = x * spatial_residuals[next_res]
+
+        return self.out_conv(x)
 
 class Discriminator(nn.module):
     def __init__(self, *, fmap_max = 512, fmap_inverse_coef = 12,
@@ -169,5 +232,52 @@ class Discriminator(nn.module):
 
         self.decoder1 = SimpleDecoder(chain_in = last_chan, chan_out = init_channel)
         self.decoder2 = SimpleDecoder(chain_in = features[-2][-1], chan_out = init_channel) if resolution >= 9 else None
+    
+    def forward(self, x, calc_aux_loss = False):
+        orig_img = x
 
-            
+        for layer in self.non_residual_layers:
+            x = layer(x)
+
+        layer_outputs = []
+
+        for (net, attn) in self.non_residual_layers:
+            if exists(attn):
+                x = attn(x) + x
+
+            x = net(x)
+            layer_outputs.append(x)
+        
+        out = self.to_logits(x).flatten(1)
+
+        img_32x32 = F.interpolate(orig_img, size = (32, 32))
+        out_32x32 = self.to_shape_disc_out(img_32x32)
+
+        if not calc_aux_loss:
+            return out, out_32x32, None
+        #self supervised auto encoding loss
+        
+        layer_8x8 = layer_outputs[-1]
+        layer_16x16 = layer_outputs[-2]
+
+        recon_img_8x8 = self.decoder1(layer_8x8)
+
+        aux_loss = F.mse_loss(
+            recon_img_8x8,
+            F.interpolate(orig_img, size = recon_img_8x8.shape[2:])
+        )
+
+        if exists(self.decoder2):
+            select_random_ quadrant = lambda rand_quadrant, img: rearrange(img, 'b c (m h) (n w) -> (m h) b c h w', m = 2, n = 2)[rand_quadrant]
+            crop_image_fn = partial(select_random_quadrant, floor(random() * 4))
+            img_part, layer_16x16_part = map(crop_image_fn, (orig_img, layer_16x16))
+
+            recon_img_16x16 = F.mse_loss(
+                recon_img_16x16,
+                F.interpolate(image_part, size = recon_img_16x16.shape[2:])
+            )
+
+            aux_loss = aux_loss + aux_loss_16x16
+
+        return out, out_32x32, aux_loss
+
