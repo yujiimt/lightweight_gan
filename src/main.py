@@ -1,3 +1,61 @@
+import torch
+from torch.nn import nn
+from torch.functional import F
+
+
+
+def default(val, d):
+    return val if exists(val) else d
+
+
+class Generator(nn.Module):
+    def __init__(
+        self, *, image_size,
+        latent_dim = 256, fmap_max = 512, fmap_inverse_coef = 12,
+        transparent = False, attn_res_layers = [], sle_spatial = False
+    ):
+
+    super().__init__()
+    resolution = log2(image_size)
+    assert is_power_of_two(image_size), 'image size must be a power of 2'
+    init_channel = 4 if transparent else 3
+    fmap_max = default(fmap_max, latent_dim)
+
+    self.initial_conv = nn.Sequential(
+        nn.ConvTranspose2d(latent_dim, latent_dim * 2, 4),
+        norm_class(latent_dim * 2),
+        nn.GLU(dim=1)
+    )
+    #resolution ってなに
+    num_layers = int(resolution) - 2
+    features = list(map(lambda n: (n, (fmap_inverse_coef - 2)), range(2, num_layers + 2)))
+    features = list(map(lambda (n[0], min(n[1], fmap_max)), featurese))
+    features = list(map(lambda n:3 if n[0] >= 8 else n[1], features))
+    features = [latent_dim, *features]
+
+    in_out_features = list(zip(features[:-1], features[1:]))
+
+    self.res_layes = range(2, num_layers + 2)
+    self.layers = nn.ModuleList([])
+    self.res_to_feature_map = dict(zip(self.res_layers, in_out_features))
+
+    self.sle_map = ((3, 7), (4, 8), (5, 9), (6, 10))
+    self.sle_map = list(filter(lambda t: t[0] <= resolution and t[1] <= resolution, self.sle_map))
+    self.sle_map = dict(self.sle_map)
+
+    self.num_layers_spatial_res = 1
+
+    for (res, (chain_in, chan_out)) in zip(self.res_layers, in_out_features):
+        image_width = 2 ** res
+
+        attn = None
+        
+        if image_width in attn_res_layers:
+            attn = Rezero(GSA(dim=chain_in, norm_queries=True))
+            
+
+
+
 class Discriminator(nn.module):
     def __init__(self, *, fmap_max = 512, fmap_inverse_coef = 12,
     transparent = False, disc_output_size = 5, attn_res_layers = []):
