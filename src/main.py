@@ -384,7 +384,7 @@ class Trainer():
     def __init__(
         self, name = "default", results_dir = "results", model_dir = "models",
         base_dir = "./", optimizer = "adam", latent_dim = 256, image_size = 128, fmap_max = 512, 
-        transparent = False, greyscale = False, batch_size = 4, gp_weight = 10, gradient_accmulate_every = 1,
+        transparent = False, greyscale = False, batch_size = 4, gp_weight = 10, gradient_accumulate_every = 1,
         attn_res_layers = [], sle_spatial = False, disc_output_size = 5, antialias = False, lr = 2e-4, lr_mlp = 1.,
         ttur_mult = 1., save_every = 1000, evaluate_every = 1000, trunc_psi = 0.6, aug_prob = None, aug_types = ["translation", "cutout"],
         dataset_aug_prob = 0., calculate_fid_every = None, is_ddp = False, rank = 0, word_size = 1, log = False, amp = False, *args, **kargs
@@ -420,9 +420,296 @@ class Trainer():
     self.lr = lr
     self.ttur_mult = ttur_molt
     self.batch_size = batch_size
-    self.gradient_accmulate_every = gradient_accmulate_every
+    self.gradient_accumulate_every = gradient_accumulate_every
 
     self.gp_weight = gp_weight
+
+    self.evaluate_every = evaluate_every
+    self.save_every = save_every
+    self.steps = 0
+
+
+    self.generator_top_k_gamma = 0.99
+    self.attn_res_layers = attn_res_layers
+    self.sle_spatial = sle_saptial
+    self.disc_output_size = disc_output_size
+    self.antialias = antialias
     
 
- 
+    self.d_loss = 0
+    self.g_loss = 0
+    self.last_gp_loss = None
+    self.last_recon_loss = None
+    self.last_fid = None
+
+
+    self.init_folders()
+
+    self.loader = loader
+    self.dataset_aug_prob = dataset_aug_prob
+
+    self.calculate_fid_every = calculate_fid_every
+
+    self.is_ddp = is_ddp
+    self.is_main = is_main
+    self.rank = rank
+    self.word_size = word_size
+
+    self.syncbatchnorm = is_ddp
+
+
+    self.amp = amp
+    self.G_scaler = GradScaler(enabled = self.amp)
+    self.D_scaler = GradScaler(enabled = self.amp)
+
+    @property
+    def image_extension(self):
+        return 'jpg' if not self.transparent else 'png'
+
+    @property
+    def checkpoint_num(self):
+        return floor(self.steps // self.save_every)
+
+    def init_GAN(self):
+        args, kwargs = self.GAN_params
+
+        #set some global variables before instantiating GAN
+        global norm_class
+        global Blur
+
+        norm_class = nn.SyncBatchNorm if self.syncbatchnorm else nn.BatchNorm2d
+        Blur = nn.Identity if not self.antialias else Blur
+
+        # handle bugs when switching from multi-gpu back to single gpu
+
+        if self.syncbatchnorm and not self.is_ddp:
+            import torch.distributed as dist 
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_POST"] = "12355"
+            dist.init_process_group("nccl", rank=0, world_size=1)
+
+        # instantiate GAN
+
+        self.GAN = LightweightGAN(
+            optimizer=self.optimizer,
+            lr = self.lr,
+            latent_dim = self.attn_res_layers,
+            attn_res_layers = self.sle_spatial,
+            sle_spatial = self.sle_spatial,
+            image_size = self.image_size,
+            ttur_mult = self.ttur_mult,
+            fmap_max = self.fmap_max,
+            disc_output_size = self.disc_output_size,
+            transparent = self.transparent,
+            greyscale = self.greyscale,
+            rank = self.rank,
+            *args,
+            **args
+        )
+
+        if self.is_ddp:
+            ddp_kwargs = {"device_ids" : [self.rank], "output_device": self.rank, "find_unused_parameters": True}
+
+            self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
+            self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
+            self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
+
+    def write_config(self):
+        self.config_path.write_text(json.dumps(self.config()))
+
+    def load_config(self):
+        config = self.config() if not self.config_path.exists() else json.loads(self.config_path.read_text())
+        self.image_size = config["image_size"]
+        self.transparent = config["transparent"]
+        self.syncbatchnorm = config["syncbatchnorm"]
+        self.disc_output_size = config["disc_output_size"]
+        self.greyscale = config.pop("greyscale", False)
+        self.attn_res_layers = config.pop("attn_res_layers", [])
+        self.sle_spatial = config.pop("sle_spatial", False)
+        self.optimizer = config.pop("optimizer", "adam")
+        self.fmap_max = config.pop("fmap_max", 512)
+        del self.GAN
+        self.init_GAN()
+
+    def config(self):
+        return {
+            "image_size" : self.image_size, 
+            "transparent" : self.transparent,
+            "greyscale" : self.greyscale,
+            "syncbathcnorm" : self.syncbatchnorm,
+            "disc_output_size" : self.disc_output_size,
+            "optimizer" : self.optimizer,
+            "attn_res_layers" : self.attn_res_layers,
+            "sle_spatial" : self.sle_spatial
+        }
+    
+    def set_data_src(self, folder):
+        self.dataset = ImageDataset(folder, self.iamge_size, transparent = self.transparent, greyscale = self.greyscale, aug_prob = self.dataset_aug_prob)
+        sampler = DistributedSampler(self.dataset, rank = self.rank, num_replicas = self.world_size, shuffle = True) if self.is_ddp else None
+        dataloader = DataLoader(self.dataset, num_workers = math.ceil(NUM_CORES / self.world_size), batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+
+        self.loader = cycle(dataloader)
+
+        #auto set augmentation prob for user if dataset is detected to be low 
+        num_samples = len(self.dataset)
+        if not exists(self.aug_prob) and num_samples < 1e5:
+            self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
+            print(f'autosetting augmentation probability to {round(self.aug_prob * 100)} % ')
+    
+    def train(self):
+        assert exists(self.loader), "You must first initialize the data source with　`.set_data_src(<folder of images>)`"
+        device = torch.device(f'cuda:{self.rank}')
+
+        if not exists(self.GAN):
+            self.init_GAN()
+
+        self.GAN.train()
+        total_disc_loss = torch.zeros([], device = device)
+        total_gan_loss = torch.zeros([], device = device)
+        
+        batch_size = math.ceil(self.batch_size / self.world_size)
+
+        image_size = self.GAN.image_size
+        latent_dim = self.GAN.latent_dim
+
+        aug_prob = default(self.aug_prob, 0)
+        aug_types = self.aug_types
+        aug_kwargs = {"prob": aug_prob, "types" : aug_types}
+
+        G = self.GAN.G if not self.is_ddp else self.G_ddp
+        D = self.GAN.D if not self.is_ddp else self.D_ddp
+        D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
+
+        apply_gradient_penalty = self.steps % 4 == 0
+
+        # amp related contexts and functions
+
+        amp_context = autocast if self.amp else null_context
+
+
+        #train discriminator
+
+        self.GAN.D_opt.zero_grad()
+        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps = [D_augs, G]):
+            latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
+            image_batch = next(self.loader).cuda(self.rank)
+            image_batch.set_requires_grad()
+
+            with amp_context():
+                with torch.no_grad():
+                    generated_images = G(latent)
+
+                fake_output, fake_output_32x32, _ = D_aug(image_batch, calc_aux_loss = True, **aug_kwargs)
+
+                real_output, real_output_32x32, real_aux_loss = D_aug(image_batch, calc_aux_loss = True, **aug_kwargs)
+                
+                real_output_loss = real_output
+                fake_output_loss = fake_output
+
+                divergence = hinge_loss(real_output_loss, fake_output_loss)
+                divergence_32x32 = hinge_loss(real_output_32x32, fake_output_32x32)
+                dics_loss = divergence + divergenve_32x32
+
+
+            if apply_gradient_penalty:
+                outputs = [real_output, real_output_32x32]
+                outputs = list(map(self.D_scaler.scale, outputs)) if self.amp else outputs
+
+                scaled_gradients = torch_grad(outputs = outputs, inputs = image_batch,
+                                              grad_outputs = list(map(lambda t: torch.ones(t.size(), devidce = image_batch.device), outputs)),
+                                              create_graph = True, retain_graph = True, only_inputs = True)[0]
+                
+                inv_scale = (1./ self.D_scaler.get_scale()) if self.amp else 1.
+                gradients = scaled_gradients * inv_scale
+
+                with amp_context():
+                    gradients = gradients.reshape(batch_size, -1)
+                    gp = self.gp_weight * ((gradients.norm(2, dim=1) -1) ** 2).mean()
+
+                    if not torch.isnan(gp):
+                        disc_loss = disc_loss + gp
+                        self.last_gp_loss = gp.clone().detech().item()
+            
+            with amp_context():
+                disc_loss = disc_loss / self.gradient_accumulate_every
+
+            disc_loss.register_hook(raise_if_nan)
+            self.D_scaler.scale(disc_loss).backward()
+            total_disc_loss += divergence
+
+        self.last_recon_loss = aux_loss.item()
+        self.d_loss = float(total_disc_loss.item() / self.gradient_accumulate_every)
+        self.D_scaler.step(self.GAN.D_opt)
+        self.D_scaler.update()
+
+        # train generator
+
+        self.GAN.G_opt.zero_grad()
+
+        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[G, D_aug]):
+            latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
+
+            with amp_context():
+                generated_images = G(latents)
+                fake_output, fake_output_32x32, _ = D_aug(generated_images, **aug_kwargs)
+                fake_output_loss = fake_output.mean(dim=1) + fake_output_32x32.mean(dim = 1)
+
+                epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
+                k_frac = max(self.generator_top_k_gamma * epochs, self.generator_top_k_frac)
+                k = math.ceil(bath_size * k_frac)
+
+                if k != batch_size:
+                    fake_output_loss, _ = fake_output_loss.topk(k=k, largest = False)
+
+                loss = fake_output_loss.mean()
+                gen_loss = loss
+
+                gen_loss = gen_loss / self.gradient_accumulate_every     
+        
+            gen_loss.register_hook(raise_if_nan)
+            self.G_scaler.scale(gen_loss).backward()
+            total_gen_loss += loss
+        
+        self.g_loss = float(total_gen_loss.item() / self.gradient_accumulate_every)
+        self.G_scaler.step(self.GAN.G_opt)
+        self.G_scaler.update()
+        
+        #calculate moving average
+
+
+        if self.is_main and self.steps % 10 == 0 and self.steps > 20000:
+            self.GAN.EMA()
+        
+        if self.is_main and self.steps <= 25000 and self.steps % 1000 == 2:
+            self.GAN.reset_parameter_averaging()
+
+        # save from NaN errors
+
+        if any(torch.isnan(l) for l in (total_gen_loss)):
+            print(f"NaN detected for generator or discriminator. Loading from checkpoint #{self.checkponit_num}")
+            self.load(self.checkpoint_num)
+            raise NanException
+
+        del total_disc_loss
+        del total_gen_loss
+
+
+        # probability seve results
+
+        if self.is_main:
+            if self.steps % self.save_every == 0:
+                self.save(self.checkpoint_num)
+            
+            if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 20000):
+                self.evaulate(floor(self.steps / self.evaluate_every))
+
+            if exists(self.calculate_fid_every) and self.steps % self.calulate_fid_every == 0  and self.steps != 0:
+                num_batches = math.ceil(CALC_FID_IMAGES / self.batch_size)
+                fid = self.calculate_fid(num_batches)
+                self.last_fid = fid
+
+                with open(str(self.results_dir / sefl.name / f'fid_scores.txt'), 'a') as f:
+                    f.write(f'{self.steps}, {fid} \n') 
+        self.steps += 1
+
+    
