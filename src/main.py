@@ -378,3 +378,51 @@ class LightweightGAN(nn.Module):
         raise NotImplemented
 
 # trainer
+
+class Trainer():
+    
+    def __init__(
+        self, name = "default", results_dir = "results", model_dir = "models",
+        base_dir = "./", optimizer = "adam", latent_dim = 256, image_size = 128, fmap_max = 512, 
+        transparent = False, greyscale = False, batch_size = 4, gp_weight = 10, gradient_accmulate_every = 1,
+        attn_res_layers = [], sle_spatial = False, disc_output_size = 5, antialias = False, lr = 2e-4, lr_mlp = 1.,
+        ttur_mult = 1., save_every = 1000, evaluate_every = 1000, trunc_psi = 0.6, aug_prob = None, aug_types = ["translation", "cutout"],
+        dataset_aug_prob = 0., calculate_fid_every = None, is_ddp = False, rank = 0, word_size = 1, log = False, amp = False, *args, **kargs
+    ):
+    
+    self.GAN_params = [args, kwargs]
+    self.GAN = None
+
+    self.name = name 
+
+    self.base_dir = base_dir
+    self.results_dir = base_dir / results_dir
+    self.models_dir = base_dir / models_dir
+    self.config_path = self.models_dir / name / ".config.json"
+
+    assert is_power_of_two(image_size), "image size must be a power of 2 (64, 128, 256, 512, 1024)"
+    assert all(map(is_power_of_two, attn_res_layers)), "resolution layers of attention must all be power of (16, 32, 64, 128, 256, 512)"
+
+
+    self.optimizer = optimizer
+    self.latent_dim = latent_dim
+    self.image_size = image_size
+    self.fmap_max = fmap_max
+    self.transparent = transparent
+    self.greyscale = greyscale
+
+    assert (int(self.transparent) + int(self.greyscale)) < 2, "you can only set either transparency or greyscale"
+
+    self.aug_prob = aug_prob
+    self.aug_types = aug_types
+    
+
+    self.lr = lr
+    self.ttur_mult = ttur_molt
+    self.batch_size = batch_size
+    self.gradient_accmulate_every = gradient_accmulate_every
+
+    self.gp_weight = gp_weight
+    
+
+ 
