@@ -1,7 +1,40 @@
-import torch
-from torch.nn import nn
-from torch.functional import F
+import os
+import json
+import multiprocessing
+from random import random
+import math
+from math import log2, floor
+from functools import partial
+from contextlib import contextmanager, ExitStack
+from pathlib import Path
+from shutil import rmtree
 
+import torch
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim import Adam
+from torch import nn, einsum
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.autograd import grad as torch_grad
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from PIL import Image
+import torchvision
+from torchvision import transforms
+from kornia import filter2D
+
+from lightweight_gan.diff_augment import DiffAugment
+from lightweight_gan.version import __version__
+
+from tqdm import tqdm
+from einops import rearrange
+from pytorch_fid import fid_score
+
+from adabelief_pytorch import AdaBelief
+from gsa_pytorch import GSA
+
+from scipy.stats import truncnorm
 
 
 def default(val, d):
@@ -771,6 +804,113 @@ class Trainer():
         return fid_score.calculate_fid_given_paths([real_path, fake_path], 256, True, 2048)
 
     @torch.no_grad()
-    def generate_interpolation(self, num = 0, num_image_title = 8, trunc = 1.0, num_steps = 100m save_frames = False):
+    def generated_truncated(self, G, style, trunc_psi = 0.75, num_image_tiles = 8):
+        generated_images = evaluate_in_chunks(self.batch_size, G, style)
+        return generated_images.clamp_(0., 1.)
+    
+    @torch.no_grad()
+    def generated_interpolation(self, num = 0, num_image_titles = 8, trunc = 1.0, num_setps = 100, save_frames = False):
+        self.GAN.eval()
+        ext = self.image_extension
+        num_rows = num_image_titles
+
+        latent_dim = self.GAN.latent_dim
+
+        # latents and noise
+
+        latent_low = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
+        latent_high = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
+
+        ratios = torch.linspace(0., 8., num_setps)
+
+        frames = []
+
+        for ratio in tqdm(ratios):
+            interp_latents = slerp(ratio, latents_low, latents_high)
+            generated_images = self.generate_truncated(self.GAN.GE, interp_latents)
+            image_grid = torchvision.utils.make_grid(generated_images, nrow = num_rows)
+            pil_image = transforms.ToPILImage()(image_grid.cpu())
+
+            if self.transparent:
+                background = Image.new('RGBA', pil_images.size, (255, 255, 255))
+                pil_image = Image.alpha_composite(background, pil_image)
+            
+            frames.append(pil_image)
+        
+        frames[0].save(str(self.results_dir / self.name / f'{str(num)}.gif'), save_all = True, append_images = frames[1:], duration = 80, loop = 0, optimizer = True)
+
+        if save_frames:
+            folder_path = (self.results_dir / self.name / f'{str(num')
+            folder_path.mkdir(parents = True, exist_ok = True)
+            for ind, frame in enumerate(frames):
+                frame.save(str(folder_path / f'{str(ind)}.ext{ext}'))
+
+    def print_log(self):
+        data = [
+            ('G', self.g_loss),
+            ('D', self.d_loss),
+            ('GP', self.last_gp_loss),
+            ('SS', self.last_recon_loss),
+            ('FID', self.last_fid)
+        ]
+
+        data = [d for d in data if exists)d[1]]
+        log = ' | '.join(map(lambda n: f'{n[0]}: {n[1]:.2f}', data))
+        print(log)
+
+    def model_name(self, num):
+        return str(self.models_dir / self.name / f'model_{num}.pt')
+    
+    def init_folders(self):
+        (self.results_dir / self.name).mkdir(parents=True, exist_ok = True)
+        (self.models_dir / self.name).mkdir(parents = True, exist_ok = True)
+
+    def clear(self):
+        rmtree(str(self.models_dir / self.name), True)
+        rmtree(str(self.results_dir/ self.name), True)
+        rmtree(str(self.config_path), True)
+        self.init_folders()
+    
+    def save(self, num):
+        save_data = {
+            "GAN" : self.GAN.state_dict(),
+            "version" : __version__, 
+            "G_scaler" : self.G_scaler.state_dict(),
+            "D_scaler" : self.D_scaler.state_dict()
+        }
+
+        torch.save(save_data, self.model_name(num))
+        self.write_config()
+
+    def load(self, num - 1):
+        self.load_config()
+
+        name = num
+
+        if num == -1:
+            file_paths = [p for p in Path(self.models_dir / self.name).glob('model_*.pt')]
+            save_nums = sorted(map(lambda x: int(x.stem.split('_')[1]), file_paths))
+            if len(saved_nums) == 0:
+                return
+            name = saved_nums[-1]
+            print(f'continuing from previous epoch - {name}')
+
+        self.steps = name * self.save_every
+
+        load_data = torch.load(self.model_name(name))
+
+        if 'version' in load_data and self.is_main:
+            print(f'loading from version {load_data["version]}')
+        try:
+            self.GAN.load_state_dict(load_data["GAN"])
+        except Exception as e:
+            print("unable to laod save model. please try downgrading the version specified by the saved model")
+            raise e
+
+        if 'G_scaler' in load_data:
+            self.G_scaler.load_state_dict(load_data["G_scaler"])
+        if 'D_scaler' in load_data:
+            self.D_scaler.load_state_dict(load_data["D_scaler"])
+
         
     
