@@ -36,12 +36,307 @@ from gsa_pytorch import GSA
 
 from scipy.stats import truncnorm
 
+assert torch.cuda.is_available(), 'You neeed to have an Nvida GPU with CUDA instaled'
+
+# constants
+
+NUM_CORES = multiprocessing.cpu_count()
+EXTS = ['jpg', 'jpeg', 'png']
+CALC_FID_NUM_IMAGES = 128000
+
+
+# helpers
+
+def exists(val):
+    return val is not None
+
+@contextmanager
+def null_context():
+    yield
+
+def combine_contexts(contexts):
+    @contextmanager
+    def multi_contexts():
+        with ExitStack() as stack:
+            yield [stack.enter_context(ctx()) for ctx in contexts]
+    return multi_contexts
+
+def is_power_of_two(val):
+    return log2(val).is_integer()
 
 def default(val, d):
     return val if exists(val) else d
-def upsample(scale_factor = 2):
-    return nn.upsample(scale_factor = scale_factor)
 
+def set_requires_grad(model, bool):
+    for p in model.parameters():
+        p.requires_grad = bool
+
+def cycle(iterable):
+    while True:
+        for i in iterable:
+            yield i
+
+def raise_if_nan(t):
+    if torch.isnan(t):
+        raise NanException
+
+def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
+    if is_ddp:
+        num_no_syncs = gradient_accumulate_every - 1
+        head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
+        tail = [null_context]
+        contexts = head + tail
+    else:
+        contexts = [null_context] * gradient_accumulate_every
+    
+    for context in contexts:
+        with context():
+            yield
+
+def hinge_loss(real, fake):
+    return (F.relu(1 + real) + F.relu(1 - fake)).mean()
+
+def evaluate_in_chunks(max_batch_size, mode, *args):
+    splits_args = list(zip(*list(map(lambda x: x.split(max_batch_size, dim=0), args))))
+    chunked_outputs = [model(*i) for i in split_args]
+    if len(chunked_outputs)  == 1:
+        return chunked_outputs[0]
+    return torch.cat(chunked_outputs, dim=0)
+
+def slerp(val, low, high):
+    low_norm = low / torch.norm(high, dim=1, keepdim=True)
+    high_norm = high / torch.norm(high, dim=1, keepdim=True)
+    omega = torch.acos((low_norm * high_norm).sum(1))
+    so = torch.sin(omega)
+    res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
+    return res
+
+def truncted_normal(size, threshold = 1.5):
+    values = truncnorm.rvs(-threshold, threshold, size = size)
+    return torch.from_numpy(values)
+
+# helper classes
+
+class NanException(Exception):
+    pass
+
+class EMA():
+    def __init__(self,beta):
+        super().__init__()
+        self.beta = beta
+    
+    def update_average(self, old, new):
+        if not ecists(old):
+            return new
+        return old * self.beta + (1 - self.beta) * new
+
+class RandomApply(nn.Module):
+    def __init__(self, prob, fn, fn_else = lambda x: x):
+        super().__init__()
+        self.fn = fn
+        self.fn_else = fn_else
+        self.prob = prob
+    def forward(slef, x):
+        fn = self.fn if random() < self.prob else self.fn_else
+        return fn(x)
+
+class Rezero(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        self.g = nn.Parameter(torch.tensor(1e-3))
+
+    def forward(self, x):
+        return self.g * self.fn(x)
+
+class Residual(nn.Module):
+    def __init__(slef, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x) + x
+
+class SumBranches(nn.Module):
+    def __init__(self, branches):
+        super().__init__()
+        self.branches = nn.ModuleList(branches)
+    def forward(self, x):
+        return sum(map(lambda fn: fn(x), self.branches))
+
+class Blur(nn.Module):
+    def __init__(self):
+        super().__init__()
+        f = torch.Tensor([1, 2, 1])
+        self.register_buffer('f', f)
+    def forward(self, x):
+        f = self.f
+        f = f[None, None, :] * f [None, : None]
+        return filter2D(x, f, normalized=True)
+
+# dataset
+
+def convert_image_to(img_type, image):
+    if image.mode != img_type:
+        return image.convert(image_type)
+    return image
+
+class Identity(object):
+    def __call__(self, tensor):
+        return tensor
+
+class expand_greyscale(object):
+    def __init__(self, transparent):
+        self.transparent = transparent
+
+    def __call__(self, tensor):
+        channels = tensor.shape[0]
+        num_target_channels = 4 if self.transparent else 3
+
+        if channels == num_target_channels:
+            return tensor
+        
+        alpha = None
+        if channels == 1:
+            color = tensor.expand(3, -1, -1)
+        elif channels == 2:
+            color = tensor[:1].expand(3, -1, -1)
+            alpha = tensor[1:]
+        else:
+            raise Exception(f'image with invalid number of channels given {channels}')
+
+        if not exists(alpha) and self.transparnt:
+            alpha = torch.ones(1, *tensor.shape[1:],device = tensor.device)
+        
+        return color if not self.transparent else torch.cat((color, alpha))
+
+def resize_to_minimum_size(min_size, image):
+    if max(*image.size) < min_size:
+        return torchvision.transforms.functional.resize(image, min_size)
+    return image
+
+
+class ImageDataset(Dataset):
+    def __init__(
+        self,floder, image_size, transparent = False,
+        greyscale = False, aug_prob = 0.
+    ):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.path = [p for ext in EXTS for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        assert len(self.path) > 0, f'No image were found in {folder} for training'
+
+        if transparent:
+            num_channels = 4
+            pillow_mode = 'RGBA'
+            expand_fn = expand_greyscale(transparent)
+        elif greyscale:
+            num_channels = 1
+            pillow_mode = 'L'
+            expand_fn = indentity()
+        else:
+            num_channels = 3
+            pillow_mode = 'RGB'
+            expand_fn = expand_greyscale(transparent)
+
+        convert_image_fn = partial(convert_image_to, pillow_mode)
+
+        self.transfor = transforms.Compose([
+            transforms.lambda(convert_image_fn),
+            transforms.Lambda(partial(resize_to_minimum_size, image_size)),
+            RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale = (0.5, 1.0), ratio = (0.98, 1.02)), transforms.CenterCrop(image_size)),
+            transforms.ToTensor(),
+            transforms.lambda(expand_fn)
+        ])
+    
+    def __len__(self):
+        return len(self.paths)
+    
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+        return self.transform(img)
+
+# augmentations
+
+def random_hflip(tensor, prob):
+    if prob > random():
+        return tensor
+    return torch.flip(tensor, dims = (3,))
+
+class AugWrapper(nn.Module):
+    def __init__(self, D, image_size):
+        super().__init__()
+        self.D = D
+
+    def forward(self, images, prob = 0., types = [], detach = False, **kwargs):
+        context = torch.no_grad if detach else null_context
+
+        with context():
+            if random() < prob:
+                images = random_hflip(images, prob=0.5)
+                images = DiffAugment(images, type=types)
+        return self.D(image, **kwargs)
+
+# modifiable global valiables 
+norm_class = nn.BatchNorm2d
+
+def upsample(scale_tactor = 2):
+    return  nn.Upsample(scale_tactor = scale_tactor)
+
+# classes
+
+class SLE(nn.Module):
+    def __init__(
+        self,
+        *,
+        chan_in,
+        chan_out
+    ):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.max_pool = nn.AdaptiveAvgPool2d((4, 4))
+
+        chan_intermediate = chan_in // 2
+        self.net = nn.Sequential(
+            nn.Conv2d(chan_in * 2, chan_intermediate, 4),
+            nn.LeakyRelu(0.1),
+            nn.Conv2d(chan_intermediate, chan_out, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        pooled_avg = self.avg_pool(x)
+        pooled_max = self.max_pool(x)
+        return self.net(torch.cat((pooled_max, pooled_avg), dim = 1))
+
+class SpatialSLE(nn.Module):
+    def __init__(self, upsample_times, num_groups = 2):
+        super().__init__()
+        self.num_groups = num_groups
+        chan = num_groups * 2
+
+        self.net = nn.Sequential(
+            nn.Conv2d(chan, chan, 3, padding = 1),
+            upsample(2 ** , upsample_times),
+            nn.Conv2d(chan, chan, 3, padding = 1),
+            nn.LeakyRelu(0.1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        b, c, h, w = x.shape
+        num_groups = self.num_groups
+        mult = math.ceil(c / num_groups)
+        padding = (mult - c % mult) // 2
+        x_padded = F.pad(x, (0, 0, 0, 0, padding, padding))
+        x = rearrange(x_padded, 'b (g c) h w -> b g b h w', g = num_groups)
+
+
+        pooled_avg = x.mean(dim = 2)
+        pooled_max, _ = x.max(dim = 2)
+        pooled = torch.cat((pooled_avg, pooled_max), dim = 1)
+        return self.net(pooled)
 
 
 class Generator(nn.Module):
