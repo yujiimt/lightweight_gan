@@ -694,7 +694,7 @@ class Trainer():
         del total_gen_loss
 
 
-        # probability seve results
+        # probability save results
 
         if self.is_main:
             if self.steps % self.save_every == 0:
@@ -712,4 +712,65 @@ class Trainer():
                     f.write(f'{self.steps}, {fid} \n') 
         self.steps += 1
 
+    @torch.no_grad()
+    def evaulate(self, num = 0, num_image_title = 8, trunc = 1.0):
+        self.GAN.eval()
+
+        ext = self.image_extension
+        num_rows = num_image_title
+
+
+        #latents and noise
+
+        latents = torch.randn((num_rows ** 2, latent_dim)).cuda(self.rank)
+
+        #regular
+        generated_images = self.generate_treancated(self.GAN.GE, latents)
+        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f"{str(num)}.{ext}"), nrow = num_rows)
+
+        #moving average
+
+        generated_images = self.generate_treancated(self.GAN.GE, latents)
+        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f"{str(num)}-ema.{ext}"), nrow = num_rows)
+    
+    @torch.no_grad()
+    def calculate_fid(self, num_batches):
+        torch.cuda.empty_cache()
+
+        real_path = str(self.results_dir / self.name / "fid_real") + "/"
+        fake_path = str(self.results_dir / self.name / "fid_fake") + "/"
+
+        #remove any extising files used for fid calculation and recreate directories
+        rmtree(real_path, ignore_erros = True)
+        rmtree(real_path, ignore_erros = True)
+        os.makedirs(real_path)
+        os.makedirs(fake_path)
+
+
+        for batch_norm in tqdm(range(num_batches), desc = "calculating FID - saving reals"):
+            real_batch = next(self.loader)
+            for k in range(real_batch.size(0)):
+                torchvision.utils.save_image(real_batch[k, :, :, :], real_path + "{}.png".format(k + batch_num * self.batch_size))
+        
+        #generate a bunch of fake images in results / name / fid_fake
+        self.GAN.eval()
+        ext = self.image_extension
+
+        latent_dim = self.GAN.latent_dim
+        image_size = self.GAN.image_size
+
+        for batch_num in tqdm(range(num_batches), desc = "calculating FID - saving generated"):
+            # latents and noise
+            latents = torch.randn(self.batch_size, latent_dim).cuda(self.rank)
+
+            #moving average
+            generated_images = self.generate_truncated(self.GAN.GE, latents)
+
+            for j in range(generated_images.size(0)):
+                torchvision.utils.save_image(generated_images[j, :, :, :], str[path(fake_path) / f"{str(j + batch_num * self.batch_size)}-ema{ext}"))
+        return fid_score.calculate_fid_given_paths([real_path, fake_path], 256, True, 2048)
+
+    @torch.no_grad()
+    def generate_interpolation(self, num = 0, num_image_title = 8, trunc = 1.0, num_steps = 100m save_frames = False):
+        
     
